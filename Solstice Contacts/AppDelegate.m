@@ -7,8 +7,13 @@
 //
 
 #import "AppDelegate.h"
+#import "ContactBasic.h"
+#import "ContactDetails.h"
+#import "ContactsTableViewController.h"
 
-@interface AppDelegate ()
+@interface AppDelegate () {
+    UILabel *loadingLabel;
+}
 
 @end
 
@@ -16,8 +21,120 @@
 
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    // Override point for customization after application launch.
+    
+    // Set the All Contacts view's context to the app context
+    UINavigationController *navigationController = (UINavigationController *)self.window.rootViewController;
+    ContactsTableViewController *controller = (ContactsTableViewController *)navigationController.topViewController;
+    controller.managedObjectContext = self.managedObjectContext;
+    
+    // If this is the first launch, grab all the default contacts from the endpoint
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"HasLaunchedOnce"]) {
+        
+        UINavigationController *navigationController = (UINavigationController *)self.window.rootViewController;
+        ContactsTableViewController *controller = (ContactsTableViewController *)navigationController.topViewController;
+        
+        // Also, show an activity indicator and put up a load label to let the user know it's loading
+        controller.activityIndicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleGray];
+        controller.activityIndicator.center = controller.view.center;
+        [controller.activityIndicator hidesWhenStopped];
+        [controller.activityIndicator startAnimating];
+        [controller.view addSubview:controller.activityIndicator];
+        
+        loadingLabel = [[UILabel alloc] initWithFrame:CGRectMake(controller.view.center.x - 40, controller.view.center.y - 30, 80, 25)];
+        loadingLabel.text = @"Downloading contacts...";
+        [loadingLabel sizeToFit];
+        loadingLabel.center = controller.view.center;
+        [controller.view addSubview:loadingLabel];
+        
+        // Start getting data in the background
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:@"https://solstice.applauncher.com/external/contacts.json"]];
+            [self performSelectorOnMainThread:@selector(fetchedData:) withObject:data waitUntilDone:YES];
+        });
+        
+        // Set up employee ID "global"
+        [[NSUserDefaults standardUserDefaults] setInteger:21 forKey:@"nextEmployeeID"];
+
+        // Inform that we've passed first launch
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"HasLaunchedOnce"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+    
     return YES;
+}
+
+// Called once the JSON is collected from the endpoint
+- (void)fetchedData:(NSData *)responseData {
+    
+    NSManagedObjectContext *managedObjectContext = [self managedObjectContext];
+    NSError *error;
+    NSArray *json = [NSJSONSerialization JSONObjectWithData:responseData options:kNilOptions error:&error];
+    NSEntityDescription *contactBasic = [NSEntityDescription entityForName:@"ContactBasic" inManagedObjectContext:managedObjectContext];
+    
+    // Get all attributes of a ContactBasic object
+    NSDictionary *attributes = [contactBasic attributesByName];
+    
+    // For every JSON object returned, create a new ContactBasic entity populate it's attributes
+    for (int i = 0; i < [json count]; i++) {
+        ContactBasic *newItem = [NSEntityDescription insertNewObjectForEntityForName:@"ContactBasic" inManagedObjectContext:managedObjectContext];
+        for (NSString *attribute in attributes) {
+            id value = [json[i] objectForKey:attribute];
+            if (value == nil) {
+                continue;
+            }
+            // Change the format of the phone numbers right away to desired format
+            if ([attribute isEqualToString:@"phone"]) {
+                NSMutableDictionary *phoneDict = [NSMutableDictionary dictionaryWithDictionary:(NSDictionary *) value];
+                if ([phoneDict objectForKey:@"mobile"] != nil && ![[phoneDict objectForKey:@"mobile"] isEqualToString:@""]) {
+                    [phoneDict setObject:[self parsePhoneNumber:[phoneDict objectForKey:@"mobile"]] forKey:@"mobile"];
+                }
+                [phoneDict setObject:[self parsePhoneNumber:[phoneDict objectForKey:@"home"]] forKey:@"home"];
+                [phoneDict setObject:[self parsePhoneNumber:[phoneDict objectForKey:@"work"]] forKey:@"work"];
+                [newItem setValue:phoneDict forKey:attribute];
+            } else {
+                [newItem setValue:value forKey:attribute];
+            }
+        }
+    }
+    
+    // Save all the new objects to app context
+    if (![managedObjectContext save:&error]) {
+        NSLog(@"Error saving basic contacts: %@", [error localizedDescription]);
+    }
+    
+    // Set up a fetch request to load all the basic contacts into the All Contacts view
+    NSFetchRequest *fetchRequest = [[NSFetchRequest alloc] init];
+    NSSortDescriptor *nameDescriptor = [[NSSortDescriptor alloc] initWithKey:@"name" ascending:YES];
+    [fetchRequest setEntity:contactBasic];
+    [fetchRequest setSortDescriptors:@[nameDescriptor]];    
+
+    UINavigationController *navigationController = (UINavigationController *)self.window.rootViewController;
+    ContactsTableViewController *controller = (ContactsTableViewController *)navigationController.topViewController;
+    
+    controller.contactBasics = [managedObjectContext executeFetchRequest:fetchRequest error:&error];
+    [controller.tableView reloadData];
+    
+    // Load all of the details too.
+    // I originally wanted to leave this until later (e.g. after loading the table view),
+    // but I ran into an issue if a contact is selected from the table before all the details are loaded
+    // So, we just have to wait a couple extra seconds before we can see anything.. not such a big deal.
+    [controller loadContactDetails];
+    
+    // Data is loaded, stop the spinning gear, start loading contact details
+    [controller.activityIndicator stopAnimating];
+    [loadingLabel removeFromSuperview];
+    
+}
+
+// Helper to get our phone numbers how we want them
+- (NSString *)parsePhoneNumber:(NSString *)original {
+    NSMutableString *new = [NSMutableString stringWithString:original];
+    [new insertString:@"(" atIndex:0];
+    [new insertString:@")" atIndex:4];
+    [new replaceCharactersInRange:NSMakeRange(5, 1) withString:@" "];
+    
+    NSString *nonmutable = [NSString stringWithString:new];
+    return nonmutable;
 }
 
 - (void)applicationWillResignActive:(UIApplication *)application {
